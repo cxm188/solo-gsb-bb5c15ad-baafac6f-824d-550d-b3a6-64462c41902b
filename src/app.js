@@ -3,6 +3,7 @@ import Fastify from 'fastify';
 import { mergePatches, PatchError } from './merge.js';
 import { auditOrdering } from './audit.js';
 import { MergeStore } from './store.js';
+import { previewResolution, ResolutionError } from './resolution.js';
 import { EXAMPLE_REQUEST, EXAMPLE_CONFLICT_REQUEST } from './example.js';
 
 export const VERSION = '1.0.0';
@@ -26,6 +27,26 @@ const mergeBodySchema = {
     base: true,
     patchA: { type: 'array', items: operationSchema },
     patchB: { type: 'array', items: operationSchema },
+  },
+};
+
+const resolutionBodySchema = {
+  type: 'object',
+  required: ['resolutions'],
+  additionalProperties: false,
+  properties: {
+    resolutions: {
+      type: 'array',
+      items: {
+        type: 'object',
+        required: ['conflict', 'winner'],
+        additionalProperties: false,
+        properties: {
+          conflict: { type: 'integer', minimum: 0 },
+          winner: { type: 'string', enum: ['A', 'B'] },
+        },
+      },
+    },
   },
 };
 
@@ -85,6 +106,8 @@ export function buildApp(options = {}) {
       'GET /api/v1/merges/:id': 'fetch one rehearsal (inputs + outcome)',
       'GET /api/v1/merges/:id/order-audit':
         'replay saved patches A→B and B→A under strict RFC 6902 ordering (commutative / divergent / failed)',
+      'POST /api/v1/merges/:id/resolution-preview':
+        'preview a conflict resolution by choosing winner A or B per conflict ordinal (no stored changes)',
       'DELETE /api/v1/merges/:id': 'delete one rehearsal',
     },
   }));
@@ -157,6 +180,43 @@ export function buildApp(options = {}) {
       ...result,
     };
   });
+
+  app.post(
+    '/api/v1/merges/:id/resolution-preview',
+    { schema: { body: resolutionBodySchema } },
+    async (req, reply) => {
+      const record = store.get(req.params.id);
+      if (!record) {
+        return reply.code(404).send({
+          statusCode: 404,
+          error: 'Not Found',
+          message: `no rehearsal stored with id ${req.params.id}`,
+        });
+      }
+      try {
+        const result = previewResolution(record, req.body.resolutions);
+        return reply
+          .code(result.status === 'clean' ? 200 : 409)
+          .send({
+            id: record.id,
+            createdAt: record.createdAt,
+            resolutions: req.body.resolutions,
+            ...result,
+          });
+      } catch (err) {
+        if (err instanceof ResolutionError) {
+          return reply.code(err.statusCode).send({
+            statusCode: err.statusCode,
+            error: STATUS_CODES[err.statusCode],
+            code: err.code,
+            message: err.message,
+            details: err.details,
+          });
+        }
+        throw err;
+      }
+    },
+  );
 
   app.delete('/api/v1/merges/:id', async (req, reply) => {
     if (!store.delete(req.params.id)) {

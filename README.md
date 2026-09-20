@@ -55,6 +55,7 @@ npm ci && npm start
 | `GET` | `/api/v1/merges` | 列出全部预演记录（摘要） |
 | `GET` | `/api/v1/merges/:id` | 查询单条预演（含输入与结果） |
 | `GET` | `/api/v1/merges/:id/order-audit` | 对已保存输入按严格 RFC 6902 顺序重放 A→B 与 B→A，判定可交换性 |
+| `POST` | `/api/v1/merges/:id/resolution-preview` | 对 status=conflict 的已保存记录按冲突序号提交 A/B 裁决，预览解决结果（不落库） |
 | `DELETE` | `/api/v1/merges/:id` | 删除单条预演（`204`） |
 
 ### `POST /api/v1/merges`
@@ -188,6 +189,89 @@ curl -s http://localhost:3000/api/v1/merges/<id>/order-audit | jq
 顺序重放得到 `divergent`：同一下标缝隙的插入在两种次序下落点不同，最小差异路径为
 `/servers/0/host`（`A->B` 为 `a2.internal`，`B->A` 为 `b.internal`）。
 
+### `POST /api/v1/merges/:id/resolution-preview`（冲突解决预览）
+
+对一条**已保存且 `status=conflict`** 的预演记录，按 `POST /api/v1/merges` 返回的冲突数组
+**序号**（从 0 起，顺序与该记录 `conflicts` 数组一致）逐项提交保留方（`winner` 为 `A` 或
+`B`），服务把败方原始操作从保存的 `patchA` / `patchB` 中剔除后，**重新调用同一套基准坐标
+合并逻辑**给出预览结果。预览是已保存输入与裁决的纯函数：
+
+- **不修改任何存储记录**——冲突记录保持 `status: "conflict"`、`merged: null`，原始
+  `patchA` / `patchB` 原样保留；
+- 相同请求重复提交结果**逐字节一致**；裁决数组中各项的先后次序不影响结果（按冲突序号对应）。
+
+请求体：
+
+```json
+{
+  "resolutions": [
+    { "conflict": 0, "winner": "A" },
+    { "conflict": 1, "winner": "B" }
+  ]
+}
+```
+
+约束与状态码：
+
+| 情况 | 状态码 | 说明 |
+| --- | --- | --- |
+| 记录不存在 | `404` | — |
+| 记录存在但不是 `conflict` 状态 | `409` | `code: "NOT_CONFLICTED"` |
+| 请求体结构不合法（非数组、`winner` 非 A/B 等） | `400` | schema 校验 |
+| 未**恰好**覆盖全部冲突（缺项、重复项、越界序号） | `422` | `code: "INCOMPLETE_RESOLUTION"`，`details` 列出 `missing` / `duplicate` / `outOfRange` 序号 |
+| 同一原始操作在不同冲突中被同时要求保留和丢弃 | `422` | `code: "CONTRADICTORY_RESOLUTION"`，`details.conflicts` 列出操作（`side`、`index`）及 `retainedIn` / `droppedIn` 的冲突序号 |
+| 过滤后重新合并仍有冲突 | `409` | 返回 `status: "conflict"` 与**剩余冲突**（可能由补丁内 last-wins 等规则在败方剔除后暴露） |
+| 过滤后合并成功 | `200` | `status: "clean"` 与预览合并结果 |
+
+> 同一操作可同时出现在多条冲突中（例如 A 的 `remove /o` 与 B 对 `/o/x`、`/o/y` 的两处修改
+> 各产生一条冲突）。若这些冲突的裁决要求该操作的角色一致（同为保留或同为丢弃）则合法，
+> 列表中该操作只出现一次，`conflictIndices` 给出全部相关冲突序号；角色互相矛盾时返回
+> `422` 并列出操作与各自的冲突序号。
+
+成功（`200`）响应：
+
+```jsonc
+{
+  "id": "...",
+  "createdAt": "...",
+  "resolutions": [ { "conflict": 0, "winner": "A" } /* 回显请求裁决 */ ],
+  "status": "clean",
+  "merged": { /* 剔除败方后的基准坐标合并文档 */ },
+  "conflicts": [],
+  "retained": [
+    {
+      "side": "A", "index": 0, "op": "remove", "path": "/database",
+      "conflictIndices": [0]          // 该操作作为胜方出现的冲突序号
+    }
+  ],
+  "dropped": [
+    {
+      "side": "B", "index": 0, "op": "replace", "path": "/database/host",
+      "value": "db2.internal",        // 非 remove 操作带 value
+      "conflictIndices": [0]          // 该操作作为败方出现的冲突序号
+    }
+  ],
+  "stats": { /* 对过滤后补丁重新运行合并得到的统计；received 为过滤后的操作数 */ }
+}
+```
+
+过滤后仍有冲突时（`409`）响应结构相同，但 `status` 为 `"conflict"`、`merged` 为 `null`、
+`conflicts` 为重新检测出的剩余冲突；`retained` / `dropped` 仍如实反映本次裁决。
+
+示例：
+
+```bash
+# 1) 制造冲突并取得记录 id
+ID=$(curl -s -X POST http://localhost:3000/api/v1/merges \
+  -H 'Content-Type: application/json' \
+  -d @examples/conflict-request.json | jq -r .id)
+
+# 2) 冲突 0（/database）保留 A，冲突 1（/mode）保留 B
+curl -s -X POST "http://localhost:3000/api/v1/merges/$ID/resolution-preview" \
+  -H 'Content-Type: application/json' \
+  -d '{"resolutions":[{"conflict":0,"winner":"A"},{"conflict":1,"winner":"B"}]}' | jq
+```
+
 ## 示例请求
 
 干净合并（也见 `examples/merge-request.json`，或 `GET /api/v1/example`）：
@@ -268,6 +352,9 @@ curl -s http://localhost:3000/health | jq                 # 健康检查
 curl -s http://localhost:3000/api/v1/merges | jq          # 预演记录列表
 curl -s http://localhost:3000/api/v1/merges/<id> | jq     # 单条记录（含输入）
 curl -s http://localhost:3000/api/v1/merges/<id>/order-audit | jq  # 顺序审计 A→B / B→A
+curl -s -X POST http://localhost:3000/api/v1/merges/<id>/resolution-preview \
+  -H 'Content-Type: application/json' \
+  -d '{"resolutions":[{"conflict":0,"winner":"A"}]}' | jq          # 冲突解决预览（不落库）
 curl -s -X DELETE http://localhost:3000/api/v1/merges/<id> # 删除记录
 ```
 
@@ -326,7 +413,9 @@ npm test
 覆盖：指针转义、索引漂移重定位、同缝隙 A/B 定序、去重规则、全部冲突类型、
 非法补丁（`422`）、schema 校验（`400`）、存储的增删查、健康检查，以及顺序审计的
 可交换 / 发散（RFC 6901 字典序最小差异）/ 失败（失败方、原始序号、失败前文档）判定与
-重复查询确定性等。
+重复查询确定性；冲突解决预览的恰好覆盖（`422`）、矛盾裁决（`422`，同一操作跨冲突既保留
+又丢弃）、过滤后剩余冲突（`409`）、非冲突记录（`409`）、不存在（`404`）、不落库与
+重复请求确定性等。
 
 ## 项目结构
 
@@ -337,6 +426,7 @@ npm test
 │   ├── app.js                 # Fastify 应用：路由、schema 校验、错误处理
 │   ├── merge.js               # 合并引擎：规范化 → 补丁内解析 → 跨补丁冲突检测 → 应用
 │   ├── audit.js               # 顺序审计：严格 RFC 6902 顺序重放 A→B / B→A、失败捕获、字典序最小差异
+│   ├── resolution.js          # 冲突解决预览：按冲突序号剔除败方后复用基准坐标合并逻辑（纯函数）
 │   ├── store.js               # 内存存储（FIFO 淘汰）
 │   └── example.js             # 内置示例请求
 ├── test/                      # node:test 单元 + 集成测试
