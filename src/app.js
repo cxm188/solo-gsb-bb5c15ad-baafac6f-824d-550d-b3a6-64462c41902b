@@ -2,6 +2,7 @@ import { STATUS_CODES } from 'node:http';
 import Fastify from 'fastify';
 import { mergePatches, PatchError } from './merge.js';
 import { auditOrdering } from './audit.js';
+import { previewResolution, DecisionError, DECISION_CODES } from './resolution.js';
 import { MergeStore } from './store.js';
 import { EXAMPLE_REQUEST, EXAMPLE_CONFLICT_REQUEST } from './example.js';
 
@@ -26,6 +27,26 @@ const mergeBodySchema = {
     base: true,
     patchA: { type: 'array', items: operationSchema },
     patchB: { type: 'array', items: operationSchema },
+  },
+};
+
+const resolutionBodySchema = {
+  type: 'object',
+  required: ['decisions'],
+  additionalProperties: false,
+  properties: {
+    decisions: {
+      type: 'array',
+      items: {
+        type: 'object',
+        required: ['conflict', 'winner'],
+        additionalProperties: false,
+        properties: {
+          conflict: { type: 'integer', minimum: 0 },
+          winner: { type: 'string', enum: ['A', 'B'] },
+        },
+      },
+    },
   },
 };
 
@@ -85,6 +106,8 @@ export function buildApp(options = {}) {
       'GET /api/v1/merges/:id': 'fetch one rehearsal (inputs + outcome)',
       'GET /api/v1/merges/:id/order-audit':
         'replay saved patches A→B and B→A under strict RFC 6902 ordering (commutative / divergent / failed)',
+      'POST /api/v1/merges/:id/resolution-preview':
+        'preview per-conflict winner decisions (A/B) on a conflict record without modifying it',
       'DELETE /api/v1/merges/:id': 'delete one rehearsal',
     },
   }));
@@ -157,6 +180,58 @@ export function buildApp(options = {}) {
       ...result,
     };
   });
+
+  app.post(
+    '/api/v1/merges/:id/resolution-preview',
+    { schema: { body: resolutionBodySchema } },
+    async (req, reply) => {
+      const record = store.get(req.params.id);
+      if (!record) {
+        return reply.code(404).send({
+          statusCode: 404,
+          error: 'Not Found',
+          message: `no rehearsal stored with id ${req.params.id}`,
+        });
+      }
+      if (record.status !== 'conflict') {
+        return reply.code(409).send({
+          statusCode: 409,
+          error: 'Conflict',
+          message:
+            `rehearsal ${req.params.id} has status "${record.status}"; ` +
+            'resolution preview requires a conflict record',
+        });
+      }
+      let preview;
+      try {
+        preview = previewResolution(record, req.body.decisions);
+      } catch (err) {
+        if (err instanceof DecisionError) {
+          const statusCode =
+            err.code === DECISION_CODES.CONTRADICTORY_DECISIONS ? 422 : 400;
+          return reply.code(statusCode).send({
+            statusCode,
+            error: STATUS_CODES[statusCode],
+            code: err.code,
+            message: err.message,
+            ...err.details,
+          });
+        }
+        throw err;
+      }
+      // Pure preview: the stored record is never modified. Residual conflicts
+      // are reported with the same 409 shape as POST /api/v1/merges.
+      return reply.code(preview.status === 'clean' ? 200 : 409).send({
+        id: record.id,
+        status: preview.status,
+        merged: preview.merged,
+        conflicts: preview.conflicts,
+        retained: preview.retained,
+        dropped: preview.dropped,
+        stats: preview.stats,
+      });
+    },
+  );
 
   app.delete('/api/v1/merges/:id', async (req, reply) => {
     if (!store.delete(req.params.id)) {
